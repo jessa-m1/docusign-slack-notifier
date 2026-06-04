@@ -52,7 +52,7 @@ function formatTimestamp(isoString) {
       year: "numeric",
       hour: "numeric",
       minute: "2-digit",
-      timeZone: "UTC",
+      timeZone: "America/New_York",
       timeZoneName: "short",
     });
   } catch {
