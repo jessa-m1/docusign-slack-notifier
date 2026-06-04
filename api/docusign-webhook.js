@@ -1,70 +1,48 @@
 /**
  * DocuSign → Slack Notification Webhook
- *
- * Serverless function that receives DocuSign Connect events and posts
- * formatted messages to a private Slack channel.
- *
- * Compatible with: Vercel, AWS Lambda (via adapter), Netlify Functions
+ * Receives DocuSign Connect (REST v2.1) events and posts to Slack.
  *
  * ENV VARS REQUIRED:
- *   SLACK_WEBHOOK_URL     — Slack Incoming Webhook URL
- *   DOCUSIGN_HMAC_KEY     — (optional) HMAC secret for request verification
+ *   SLACK_WEBHOOK_URL  — Slack Incoming Webhook URL
  */
-
-const crypto = require("crypto");
 
 // ─── Event config ─────────────────────────────────────────────────────────────
 
-const EVENT_CONFIG = {
-  "envelope-sent": { emoji: "📤", label: "DocuSign Sent" },
-  "envelope-completed": { emoji: "✅", label: "DocuSign Signed" },
-  "envelope-declined": { emoji: "❌", label: "DocuSign Declined" },
-  "envelope-voided": { emoji: "🚫", label: "DocuSign Voided" },
+const STATUS_CONFIG = {
+  sent:      { emoji: "📤", label: "DocuSign Sent" },
+  completed: { emoji: "✅", label: "DocuSign Signed" },
+  declined:  { emoji: "❌", label: "DocuSign Declined" },
+  voided:    { emoji: "🚫", label: "DocuSign Voided" },
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
- * Verify DocuSign HMAC signature (recommended in production).
- * DocuSign sends the signature in the X-DocuSign-Signature-1 header.
+ * Clean up the emailSubject — strip DocuSign's auto-added prefixes like
+ * "Complete with Docusign: " or "Please DocuSign: "
  */
-function verifyHmac(rawBody, signatureHeader, hmacKey) {
-  const computed = crypto
-    .createHmac("sha256", hmacKey)
-    .update(rawBody)
-    .digest("base64");
-  return crypto.timingSafeEqual(
-    Buffer.from(computed),
-    Buffer.from(signatureHeader)
+function cleanSubject(subject) {
+  return (subject || "Unknown Document")
+    .replace(/^(complete with docusign|please docusign|please sign|sign now|docusign):\s*/i, "")
+    .trim();
+}
+
+/**
+ * Pick the most relevant timestamp for the event.
+ */
+function getTimestamp(body) {
+  return (
+    body.completedDateTime ||
+    body.declinedDateTime  ||
+    body.voidedDateTime    ||
+    body.sentDateTime      ||
+    body.statusChangedDateTime ||
+    new Date().toISOString()
   );
 }
 
 /**
- * Extract envelope details from DocuSign Connect JSON payload.
- * Handles both v1 (envelopeSummary) and v2 (data.envelopeSummary) shapes.
- */
-function parseEnvelope(body) {
-  const summary =
-    body?.data?.envelopeSummary || body?.envelopeSummary || {};
-
-  const subject = summary.emailSubject || "Unknown Document";
-  const sentAt =
-    summary.sentDateTime ||
-    summary.createdDateTime ||
-    new Date().toISOString();
-
-  // Collect all signer recipients
-  const signers = summary?.recipients?.signers || [];
-  const recipients = signers.map((s) => ({
-    name: s.name || "Unknown",
-    email: s.email || "",
-  }));
-
-  return { subject, sentAt, recipients };
-}
-
-/**
- * Format a timestamp to something readable: "Jun 4, 2026 at 2:30 PM UTC"
+ * Format a timestamp: "Jun 4, 2026 at 2:30 PM UTC"
  */
 function formatTimestamp(isoString) {
   try {
@@ -80,49 +58,6 @@ function formatTimestamp(isoString) {
   } catch {
     return isoString;
   }
-}
-
-/**
- * Build the Slack message payload.
- * One message block per recipient (if multiple signers on one envelope).
- */
-function buildSlackPayload(eventType, envelope) {
-  const config = EVENT_CONFIG[eventType];
-  const timestamp = formatTimestamp(envelope.sentAt);
-
-  const lines = envelope.recipients.map(
-    (r) =>
-      `${config.emoji} *${config.label}* — ${envelope.subject} — ${r.name} (${r.email})`
-  );
-
-  // Fallback if no recipients parsed
-  if (lines.length === 0) {
-    lines.push(
-      `${config.emoji} *${config.label}* — ${envelope.subject}`
-    );
-  }
-
-  return {
-    blocks: [
-      {
-        type: "section",
-        text: {
-          type: "mrkdwn",
-          text: lines.join("\n"),
-        },
-      },
-      {
-        type: "context",
-        elements: [
-          {
-            type: "mrkdwn",
-            text: `🕐 ${timestamp}`,
-          },
-        ],
-      },
-      { type: "divider" },
-    ],
-  };
 }
 
 /**
@@ -144,26 +79,17 @@ async function postToSlack(payload) {
   }
 }
 
-// ─── Main handler (Vercel / Node HTTP) ───────────────────────────────────────
+// ─── Main handler ─────────────────────────────────────────────────────────────
 
 module.exports = async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method Not Allowed" });
   }
 
-  // Collect raw body for HMAC verification
+  // Read body
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
   const rawBody = Buffer.concat(chunks).toString("utf8");
-
-  // Optional HMAC verification
-  const hmacKey = process.env.DOCUSIGN_HMAC_KEY;
-  if (hmacKey) {
-    const sig = req.headers["x-docusign-signature-1"];
-    if (!sig || !verifyHmac(rawBody, sig, hmacKey)) {
-      return res.status(401).json({ error: "Invalid signature" });
-    }
-  }
 
   let body;
   try {
@@ -172,15 +98,42 @@ module.exports = async function handler(req, res) {
     return res.status(400).json({ error: "Invalid JSON" });
   }
 
-  // DocuSign event name (e.g. "envelope-sent")
-  const eventType = body?.event || body?.data?.event;
-  if (!EVENT_CONFIG[eventType]) {
-    // Unknown or unmonitored event — acknowledge and ignore
-    return res.status(200).json({ ok: true, skipped: true });
+  // DocuSign REST v2.1 sends status at the root level
+  const status = (body.status || "").toLowerCase();
+  const config = STATUS_CONFIG[status];
+
+  if (!config) {
+    // Not an event we care about — acknowledge and ignore
+    return res.status(200).json({ ok: true, skipped: true, status });
   }
 
-  const envelope = parseEnvelope(body);
-  const slackPayload = buildSlackPayload(eventType, envelope);
+  // Parse envelope details (data is at root level in REST v2.1)
+  const subject    = cleanSubject(body.emailSubject);
+  const timestamp  = formatTimestamp(getTimestamp(body));
+  const signers    = body?.recipients?.signers || [];
+
+  // Build one line per recipient
+  const lines = signers.map(
+    (s) => `${config.emoji} *${config.label}* — ${subject} — ${s.name} (${s.email})`
+  );
+
+  if (lines.length === 0) {
+    lines.push(`${config.emoji} *${config.label}* — ${subject}`);
+  }
+
+  const slackPayload = {
+    blocks: [
+      {
+        type: "section",
+        text: { type: "mrkdwn", text: lines.join("\n") },
+      },
+      {
+        type: "context",
+        elements: [{ type: "mrkdwn", text: `🕐 ${timestamp}` }],
+      },
+      { type: "divider" },
+    ],
+  };
 
   try {
     await postToSlack(slackPayload);
@@ -190,20 +143,3 @@ module.exports = async function handler(req, res) {
     return res.status(500).json({ error: err.message });
   }
 };
-
-// ─── AWS Lambda adapter (uncomment if deploying to Lambda) ───────────────────
-//
-// const http = require("http");
-// exports.handler = async (event) => {
-//   const req = Object.assign(new http.IncomingMessage(null), {
-//     method: event.httpMethod,
-//     headers: event.headers || {},
-//     [Symbol.asyncIterator]: async function* () { yield Buffer.from(event.body || ""); },
-//   });
-//   const results = [];
-//   const res = {
-//     status: (code) => ({ json: (body) => results.push({ statusCode: code, body: JSON.stringify(body) }) }),
-//   };
-//   await module.exports(req, res);
-//   return results[0] || { statusCode: 200, body: '{"ok":true}' };
-// };
