@@ -14,7 +14,7 @@ const STATUS_CONFIG = {
   voided:    { emoji: "🚫", label: "DocuSign Voided" },
 };
 
-// Used for intermediate signers who completed during a 'sent' event
+// Used for intermediate signers who just signed
 const SIGNED_CONFIG = { emoji: "✍️", label: "DocuSign Signed" };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -80,25 +80,26 @@ function buildLines(status, config, subject, allSigners) {
   const signerStatus = (s) => (s.status || "").toLowerCase();
 
   if (status === "sent") {
-    const lines = [];
-
-    // Intermediate signers who completed (their signing triggered this send)
+    const sentSigners   = allSigners.filter((s) => signerStatus(s) === "sent");
     const signedSigners = allSigners.filter((s) => signerStatus(s) === "completed");
-    for (const s of signedSigners) {
-      lines.push(`${SIGNED_CONFIG.emoji} *${SIGNED_CONFIG.label}* — ${subject} — ${s.name} (${s.email})`);
+
+    // If anyone is currently in "sent" state, this is a routing event — show who received the doc.
+    // Ignore completed signers here to avoid duplicating the "Signed" notification.
+    if (sentSigners.length > 0) {
+      return sentSigners.map(
+        (s) => `${config.emoji} *${config.label}* — ${subject} — ${s.name} (${s.email})`
+      );
     }
 
-    // Signers who just received the document
-    const sentSigners = allSigners.filter((s) => signerStatus(s) === "sent");
-    for (const s of sentSigners) {
-      lines.push(`${config.emoji} *${config.label}* — ${subject} — ${s.name} (${s.email})`);
+    // No one in "sent" state — this is an intermediate signing event. Show who just signed.
+    if (signedSigners.length > 0) {
+      return signedSigners.map(
+        (s) => `${SIGNED_CONFIG.emoji} *${SIGNED_CONFIG.label}* — ${subject} — ${s.name} (${s.email})`
+      );
     }
 
-    // Fallback: no filtered signers found
-    if (lines.length === 0) {
-      lines.push(`${config.emoji} *${config.label}* — ${subject}`);
-    }
-    return lines;
+    // Fallback
+    return [`${config.emoji} *${config.label}* — ${subject}`];
   }
 
   if (status === "declined") {
