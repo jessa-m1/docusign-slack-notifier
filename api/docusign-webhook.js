@@ -7,29 +7,23 @@
  */
 
 // ─── Event config ─────────────────────────────────────────────────────────────
-
 const STATUS_CONFIG = {
   sent:      { emoji: "📤", label: "DocuSign Sent" },
-  completed: { emoji: "✅", label: "DocuSign Signed" },
+  completed: { emoji: "✅", label: "DocuSign Completed" },
   declined:  { emoji: "❌", label: "DocuSign Declined" },
   voided:    { emoji: "🚫", label: "DocuSign Voided" },
 };
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// Used for intermediate signers who completed during a 'sent' event
+const SIGNED_CONFIG = { emoji: "✍️", label: "DocuSign Signed" };
 
-/**
- * Clean up the emailSubject — strip DocuSign's auto-added prefixes like
- * "Complete with Docusign: " or "Please DocuSign: "
- */
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 function cleanSubject(subject) {
   return (subject || "Unknown Document")
     .replace(/^(complete with docusign|please docusign|please sign|sign now|docusign):\s*/i, "")
     .trim();
 }
 
-/**
- * Pick the most relevant timestamp for the event.
- */
 function getTimestamp(body) {
   return (
     body.completedDateTime ||
@@ -41,9 +35,6 @@ function getTimestamp(body) {
   );
 }
 
-/**
- * Format a timestamp: "Jun 4, 2026 at 2:30 PM UTC"
- */
 function formatTimestamp(isoString) {
   try {
     return new Date(isoString).toLocaleString("en-US", {
@@ -60,33 +51,76 @@ function formatTimestamp(isoString) {
   }
 }
 
-/**
- * POST the payload to Slack.
- */
 async function postToSlack(payload) {
   const url = process.env.SLACK_WEBHOOK_URL;
   if (!url) throw new Error("SLACK_WEBHOOK_URL is not set");
-
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`Slack responded ${res.status}: ${text}`);
   }
 }
 
-// ─── Main handler ─────────────────────────────────────────────────────────────
+// ─── Build notification lines ─────────────────────────────────────────────────
+/**
+ * Returns an array of mrkdwn strings — one per notification line.
+ *
+ * For 'sent' events we filter signers by their individual status:
+ *   - status 'completed' → they just signed, triggering this send (emit Signed)
+ *   - status 'sent'      → they just received the doc (emit Sent)
+ *
+ * For 'completed' / 'voided' → single envelope-level line.
+ * For 'declined'             → only the signer(s) who declined.
+ */
+function buildLines(status, config, subject, allSigners) {
+  const signerStatus = (s) => (s.status || "").toLowerCase();
 
+  if (status === "sent") {
+    const lines = [];
+
+    // Intermediate signers who completed (their signing triggered this send)
+    const signedSigners = allSigners.filter((s) => signerStatus(s) === "completed");
+    for (const s of signedSigners) {
+      lines.push(`${SIGNED_CONFIG.emoji} *${SIGNED_CONFIG.label}* — ${subject} — ${s.name} (${s.email})`);
+    }
+
+    // Signers who just received the document
+    const sentSigners = allSigners.filter((s) => signerStatus(s) === "sent");
+    for (const s of sentSigners) {
+      lines.push(`${config.emoji} *${config.label}* — ${subject} — ${s.name} (${s.email})`);
+    }
+
+    // Fallback: no filtered signers found
+    if (lines.length === 0) {
+      lines.push(`${config.emoji} *${config.label}* — ${subject}`);
+    }
+    return lines;
+  }
+
+  if (status === "declined") {
+    const declinedSigners = allSigners.filter((s) => signerStatus(s) === "declined");
+    if (declinedSigners.length > 0) {
+      return declinedSigners.map(
+        (s) => `${config.emoji} *${config.label}* — ${subject} — ${s.name} (${s.email})`
+      );
+    }
+    return [`${config.emoji} *${config.label}* — ${subject}`];
+  }
+
+  // 'completed' and 'voided' → single envelope-level message
+  return [`${config.emoji} *${config.label}* — ${subject}`];
+}
+
+// ─── Main handler ─────────────────────────────────────────────────────────────
 module.exports = async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method Not Allowed" });
   }
 
-  // Read body
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
   const rawBody = Buffer.concat(chunks).toString("utf8");
@@ -98,28 +132,18 @@ module.exports = async function handler(req, res) {
     return res.status(400).json({ error: "Invalid JSON" });
   }
 
-  // DocuSign REST v2.1 sends status at the root level
   const status = (body.status || "").toLowerCase();
   const config = STATUS_CONFIG[status];
 
   if (!config) {
-    // Not an event we care about — acknowledge and ignore
     return res.status(200).json({ ok: true, skipped: true, status });
   }
 
-  // Parse envelope details (data is at root level in REST v2.1)
-  const subject    = cleanSubject(body.emailSubject);
-  const timestamp  = formatTimestamp(getTimestamp(body));
-  const signers    = body?.recipients?.signers || [];
+  const subject   = cleanSubject(body.emailSubject);
+  const timestamp = formatTimestamp(getTimestamp(body));
+  const allSigners = body?.recipients?.signers || [];
 
-  // Build one line per recipient
-  const lines = signers.map(
-    (s) => `${config.emoji} *${config.label}* — ${subject} — ${s.name} (${s.email})`
-  );
-
-  if (lines.length === 0) {
-    lines.push(`${config.emoji} *${config.label}* — ${subject}`);
-  }
+  const lines = buildLines(status, config, subject, allSigners);
 
   const slackPayload = {
     blocks: [
