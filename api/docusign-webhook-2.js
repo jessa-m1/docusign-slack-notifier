@@ -119,16 +119,19 @@ module.exports = async function handler(req, res) {
     return res.status(400).json({ error: "Invalid JSON" });
   }
 
-  const status = (body.status || "").toLowerCase();
+  // This DocuSign account uses REST v2.1 format — envelope data is nested under data.envelopeSummary
+  const envelope = body.data?.envelopeSummary || body;
+
+  const status = (envelope.status || "").toLowerCase();
   const config = STATUS_CONFIG[status];
 
   if (!config) {
     return res.status(200).json({ ok: true, skipped: true, status });
   }
 
-  const subject    = cleanSubject(body.emailSubject);
-  const timestamp  = formatTimestamp(getTimestamp(body));
-  const allSigners = body?.recipients?.signers || [];
+  const subject    = cleanSubject(envelope.emailSubject);
+  const timestamp  = formatTimestamp(getTimestamp(envelope));
+  const allSigners = envelope?.recipients?.signers || [];
 
   const lines = buildLines(status, config, subject, allSigners);
 
